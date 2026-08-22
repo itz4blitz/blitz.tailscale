@@ -386,7 +386,7 @@ Panel {
                   font.bold: true
                 }
                 Text {
-                  text: "Open logs in terminal  ·  journalctl for this tailscaled"
+                  text: "Open logs in terminal  ·  journalctl -fu this daemon"
                   color: root.dimColor
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
