@@ -83,6 +83,8 @@ Panel {
     onlineCount = Number(d.onlineCount || 0)
     totalCount = Number(d.totalCount || 0)
     daemons = Array.isArray(d.daemons) ? d.daemons : []
+    if (d.demoView === "detail" && daemons.length)
+      selectedDaemonId = daemons[0].id
   }
 
   function refresh() {

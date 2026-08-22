@@ -214,7 +214,57 @@ def probe_url(url: str, run=None, timeout: float = 2.0) -> int | None:
     return code if 100 <= code <= 599 else None
 
 
+def demo_view() -> str:
+    flag = Path(__file__).resolve().parent / "DEMO"
+    try:
+        if flag.is_file():
+            return flag.read_text(encoding="utf-8").strip() or "overview"
+    except OSError:
+        pass
+    return ""
+
+
+def demo_payload(view: str = "overview") -> dict:
+    def machine(name, suffix, online=True, self=False, os_name="linux"):
+        return {
+            "kind": "machine", "name": name, "online": online, "self": self,
+            "url": f"https://{name}.{suffix}", "ip": "100.64.0.2", "os": os_name,
+            "http": 200 if online else None, "lastSeen": "" if online else "2h ago",
+        }
+
+    def service(name, suffix, online=True):
+        return {
+            "kind": "service", "name": name, "online": online, "self": False,
+            "url": f"https://{name}.{suffix}", "ip": "", "os": "",
+            "http": 200 if online else None, "lastSeen": "",
+        }
+
+    home_items = [
+        service("git", "example.ts.net"), service("cloud", "example.ts.net"),
+        machine("studio", "example.ts.net", self=True), machine("nas", "example.ts.net"),
+        machine("laptop", "example.ts.net", online=False, os_name="macos"),
+    ]
+    work_items = [
+        service("ci", "corp.ts.net"), machine("builder", "corp.ts.net"),
+        machine("review", "corp.ts.net"), machine("old-box", "corp.ts.net", online=False),
+    ]
+    daemons = [
+        {"id": "home", "label": "Home", "unit": "tailscaled", "online": True, "suffix": "example.ts.net",
+         "selfName": "studio", "onlineCount": 4, "totalCount": 5, "items": home_items},
+        {"id": "work", "label": "Work", "unit": "tailscaled-work", "online": True, "suffix": "corp.ts.net",
+         "selfName": "", "onlineCount": 3, "totalCount": 4, "items": work_items},
+    ]
+    return {
+        "ready": True, "status": "ok", "demo": True, "demoView": view,
+        "daemonOnline": 2, "daemonTotal": 2, "onlineCount": 7, "totalCount": 9,
+        "daemons": daemons,
+    }
+
+
 def collect(run=None, timeout: float = 4.0, probe=None, daemons: list[dict] | None = None) -> dict:
+    view = demo_view()
+    if view:
+        return demo_payload(view)
     runner = run or subprocess.check_output
     specs = daemons if daemons is not None else discover_daemons()
     statuses = {}

@@ -1,6 +1,8 @@
 # blitz.tailscale
 
-![blitz.tailscale](screenshot.png)
+![Tailnets](screenshot.png)
+
+![Machines and services](screenshot-detail.png)
 
 Omarchy bar chip for Tailscale. Uses whatever account `tailscale status` is logged into, plus any extra `/run/tailscale-*.sock` daemons (a second tailnet, a userspace instance, etc.). No account names are hardcoded.
 

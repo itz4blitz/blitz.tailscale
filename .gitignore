@@ -3,3 +3,4 @@ __pycache__/
 *.bak*
 daemons.json
 .pytest_cache/
+DEMO
