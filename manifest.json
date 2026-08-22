@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "blitz.tailscale",
+  "name": "Tailscale",
+  "version": "1.0.0",
+  "author": "blitz",
+  "description": "Tailscale machines and reachability for any logged-in account",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Tailscale",
+    "description": "Online machines, open/ping/logs for every tailscaled",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
