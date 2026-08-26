@@ -1,0 +1,4 @@
+{
+  "default": ["git", "vault"],
+  "<daemon-id>": ["ci", "docs"]
+}

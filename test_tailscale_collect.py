@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import tailscale_collect as tc
@@ -94,6 +95,145 @@ class MergeStatusTest(unittest.TestCase):
         self.assertEqual(sorted(names), ["tower", "zen"])
         self.assertNotIn("quality", names)
         self.assertNotIn("bugtrace", names)
+
+    def test_tagged_peers_are_services(self) -> None:
+        spec = {"id": "default", "label": "Tailscale", "socket": "", "unit": "tailscaled"}
+        tagged = {
+            "id": "n1",
+            "node": {
+                "HostName": "nas",
+                "Online": True,
+                "DNSName": "nas.example.ts.net.",
+                "TailscaleIPs": ["100.9.9.8"],
+                "OS": "linux",
+                "LastSeen": "",
+                "Tags": ["tag:server"],
+            },
+        }
+        plain = {
+            "id": "n2",
+            "node": {
+                "HostName": "laptop",
+                "Online": True,
+                "DNSName": "laptop.example.ts.net.",
+                "TailscaleIPs": ["100.9.9.7"],
+                "OS": "linux",
+                "LastSeen": "",
+            },
+        }
+        payload = tc.merge_status(
+            {"default": _status(peers=[tagged, plain])},
+            daemons=[spec],
+        )
+        items = payload["daemons"][0]["items"]
+        kinds = {i["name"]: i["kind"] for i in items}
+        self.assertEqual(kinds["nas"], "service")
+        self.assertEqual(kinds["laptop"], "machine")
+        self.assertEqual(kinds["zen"], "machine")
+        # Services lead the list.
+        self.assertEqual(items[0]["name"], "nas")
+
+    def test_configured_services_ride_along_with_dns_online_state(self) -> None:
+        spec = {"id": "default", "label": "Tailscale", "socket": "", "unit": "tailscaled"}
+        peer = {
+            "id": "n1",
+            "node": {
+                "HostName": "git",
+                "Online": True,
+                "DNSName": "git.example.ts.net.",
+                "TailscaleIPs": ["100.9.9.6"],
+                "OS": "linux",
+                "LastSeen": "",
+            },
+        }
+        payload = tc.merge_status(
+            {"default": _status(peers=[peer])},
+            probes={"https://ci.example.ts.net": 200},
+            daemons=[spec],
+            services={"default": ["git", "ci", "retired"]},
+            resolve=lambda host: host != "retired.example.ts.net",
+        )
+        items = payload["daemons"][0]["items"]
+        by_name = {i["name"]: i for i in items}
+        # A name that is already a visible peer is not duplicated.
+        self.assertEqual(by_name["git"]["kind"], "machine")
+        self.assertNotIn(("service", "git"), [(i["kind"], i["name"]) for i in items])
+        # Hidden-but-registered services appear with DNS-based online state.
+        self.assertEqual(by_name["ci"]["kind"], "service")
+        self.assertTrue(by_name["ci"]["online"])
+        self.assertEqual(by_name["ci"]["url"], "https://ci.example.ts.net")
+        self.assertEqual(by_name["ci"]["http"], 200)
+        self.assertEqual(by_name["retired"]["kind"], "service")
+        self.assertFalse(by_name["retired"]["online"])
+        self.assertEqual(payload["daemons"][0]["totalCount"], 4)
+
+
+class ServiceConfigTest(unittest.TestCase):
+    def test_loads_names_per_daemon_and_drops_unsafe_ones(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "services.json"
+            path.write_text(
+                json.dumps({"default": ["git", "vault"], "work": ["ci"], "bad": ["a;rm -rf"]}),
+                encoding="utf-8",
+            )
+            config = tc.load_service_config(path)
+        self.assertEqual(config["default"], ["git", "vault"])
+        self.assertEqual(config["work"], ["ci"])
+        # Daemon ids with only unsafe names contribute nothing.
+        self.assertNotIn("bad", config)
+        self.assertTrue(all(tc.safe_name(n) for names in config.values() for n in names))
+
+    def test_missing_or_broken_file_yields_no_services(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = tc.load_service_config(Path(tmp) / "nope.json")
+            broken = Path(tmp) / "broken.json"
+            broken.write_text("{not json", encoding="utf-8")
+            self.assertEqual(missing, {})
+            self.assertEqual(tc.load_service_config(broken), {})
+
+
+class CollectProbesTest(unittest.TestCase):
+    def test_collect_probes_only_configured_service_urls(self) -> None:
+        spec = {"id": "default", "label": "Tailscale", "socket": "", "unit": "tailscaled"}
+        peer = {
+            "id": "n1",
+            "node": {
+                "HostName": "tower",
+                "Online": True,
+                "DNSName": "tower.example.ts.net.",
+                "TailscaleIPs": ["100.9.9.5"],
+                "OS": "linux",
+                "LastSeen": "",
+            },
+        }
+        status = _status(peers=[peer])
+        probed = []
+
+        def fake_run(cmd, **_kwargs):
+            assert cmd[:2] == ["tailscale", "status"]
+            return json.dumps(status)
+
+        def fake_probe(url):
+            probed.append(url)
+            return 204
+
+        payload = tc.collect(
+            run=fake_run,
+            probe=fake_probe,
+            daemons=[spec],
+            services={"default": ["ci"]},
+            resolve=lambda _host: True,
+        )
+        self.assertEqual(probed, ["https://ci.example.ts.net"])
+        service = next(i for i in payload["daemons"][0]["items"] if i["name"] == "ci")
+        self.assertEqual(service["http"], 204)
+        self.assertTrue(service["online"])
+
+    def test_dns_resolves_reports_unresolvable_hosts_as_offline(self) -> None:
+        with unittest.mock.patch("socket.getaddrinfo", side_effect=OSError("nxdomain")):
+            self.assertFalse(tc.dns_resolves("gone.example.ts.net"))
+        with unittest.mock.patch("socket.getaddrinfo", return_value=[(None, None, None, None, None)]):
+            self.assertTrue(tc.dns_resolves("live.example.ts.net"))
 
 
 class OpenUrlTest(unittest.TestCase):

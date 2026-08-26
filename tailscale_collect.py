@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
 
 ALLOWED_ACTIONS = ("open", "ping", "logs")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 SECRET_KEYS = ("nodekey", "private", "authkey", "key", "token", "cookie")
+SERVICE_CONFIG_NAME = "services.json"
 DEFAULT_DAEMON = {
     "id": "default",
     "label": "Tailscale",
@@ -78,8 +81,67 @@ def _daemon_spec(daemon_id: str, daemons: list[dict] | None = None) -> dict | No
     return None
 
 
+def service_config_path() -> Path:
+    return Path(__file__).resolve().parent / SERVICE_CONFIG_NAME
+
+
+def load_service_config(path: Path | None = None) -> dict[str, list[str]]:
+    """Read per-daemon extra service hostnames from services.json.
+
+    The file is user config (gitignored; see services.json.example) so nothing
+    about any particular tailnet is baked into the collector:
+
+        {"default": ["git", "vault"], "work": ["ci"]}
+    """
+    config_file = path or service_config_path()
+    try:
+        raw = json.loads(config_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    config: dict[str, list[str]] = {}
+    for daemon_id, names in raw.items():
+        if not isinstance(names, list):
+            continue
+        cleaned = [name for name in names if safe_name(str(name))]
+        if cleaned:
+            config[str(daemon_id)] = cleaned
+    return config
+
+
+def dns_resolves(host: str, timeout: float = 1.5) -> bool:
+    """True when MagicDNS still has a record for the host.
+
+    Service-only nodes can be hidden from this machine's peer list by ACLs,
+    so DNS is the one signal every user's client has for them.
+    """
+    if not host:
+        return False
+
+    def query() -> bool:
+        try:
+            socket.getaddrinfo(host, None)
+        except (socket.gaierror, OSError, UnicodeError):
+            return False
+        return True
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return bool(pool.submit(query).result(timeout=timeout))
+    except (FutureTimeout, OSError):
+        return False
+
+
 def _clean_host(dns_name: str) -> str:
     return str(dns_name or "").rstrip(".")
+
+
+def _peer_kind(node: dict) -> str:
+    """Tagged nodes are services in Tailscale's own model (ACL tags mark
+    service accounts, servers, and serve/funnel endpoints)."""
+    tags = node.get("Tags")
+    return "service" if isinstance(tags, list) and tags else "machine"
 
 
 def _node_item(kind: str, node: dict, suffix: str, probes: dict, is_self: bool = False) -> dict:
@@ -105,6 +167,22 @@ def _node_item(kind: str, node: dict, suffix: str, probes: dict, is_self: bool =
     }
 
 
+def _service_item(name: str, suffix: str, probes: dict, online: bool) -> dict:
+    dns = f"{name}.{suffix}" if suffix else name
+    url = f"https://{dns}"
+    return {
+        "kind": "service",
+        "name": name,
+        "online": bool(online),
+        "self": False,
+        "url": url,
+        "ip": "",
+        "os": "",
+        "http": probes.get(url),
+        "lastSeen": "",
+    }
+
+
 def open_url_for(spec: dict, name: str, status: dict | None) -> str:
     if not safe_name(name):
         return ""
@@ -116,9 +194,17 @@ def open_url_for(spec: dict, name: str, status: dict | None) -> str:
     return f"https://{name}.{suffix}"
 
 
-def merge_status(statuses: dict, probes: dict | None = None, daemons: list[dict] | None = None) -> dict:
+def merge_status(
+    statuses: dict,
+    probes: dict | None = None,
+    daemons: list[dict] | None = None,
+    services: dict[str, list[str]] | None = None,
+    resolve=None,
+) -> dict:
     probes = probes or {}
     specs = daemons if daemons is not None else discover_daemons()
+    extra_services = services or {}
+    resolver = resolve if resolve is not None else (lambda host: False)
     out = []
     for spec in specs:
         raw = (statuses or {}).get(spec["id"])
@@ -134,8 +220,16 @@ def merge_status(statuses: dict, probes: dict | None = None, daemons: list[dict]
             for peer in (raw.get("Peer") or {}).values():
                 if not isinstance(peer, dict) or not peer.get("HostName"):
                     continue
-                items.append(_node_item("machine", peer, suffix, probes))
-        items.sort(key=lambda item: (not item["online"], item["name"].lower()))
+                items.append(_node_item(_peer_kind(peer), peer, suffix, probes))
+            # Services the user registered in services.json ride along even
+            # when the tailnet hides them from this machine's peer list.
+            known = {item["name"].lower() for item in items}
+            for name in extra_services.get(spec["id"], []):
+                if name.lower() in known:
+                    continue
+                host = f"{name}.{suffix}" if suffix else name
+                items.append(_service_item(name, suffix, probes, online=resolver(host)))
+        items.sort(key=lambda item: (item["kind"] != "service", not item["online"], item["name"].lower()))
         online_count = sum(1 for item in items if item["online"])
         out.append(
             {
@@ -261,35 +355,49 @@ def demo_payload(view: str = "overview") -> dict:
     }
 
 
-def collect(run=None, timeout: float = 4.0, probe=None, daemons: list[dict] | None = None) -> dict:
+def synthetic_service_urls(statuses: dict, specs: list[dict], services: dict[str, list[str]]) -> list[str]:
+    """URLs for configured services: probe targets the netmap cannot give us."""
+    urls = []
+    for spec in specs:
+        raw = (statuses or {}).get(spec["id"])
+        if not isinstance(raw, dict):
+            continue
+        suffix = str((raw.get("CurrentTailnet") or {}).get("MagicDNSSuffix") or "").rstrip(".")
+        if not suffix:
+            continue
+        machine_names = {
+            str(node.get("HostName") or "").lower()
+            for node in [raw.get("Self") or {}, *list((raw.get("Peer") or {}).values())]
+            if isinstance(node, dict)
+        }
+        for name in services.get(spec["id"], []):
+            if name.lower() in machine_names:
+                continue
+            urls.append(f"https://{name}.{suffix}")
+    return urls
+
+
+def collect(
+    run=None,
+    timeout: float = 4.0,
+    probe=None,
+    daemons: list[dict] | None = None,
+    services: dict[str, list[str]] | None = None,
+    resolve=None,
+) -> dict:
     view = demo_view()
     if view:
         return demo_payload(view)
     runner = run or subprocess.check_output
     specs = daemons if daemons is not None else discover_daemons()
+    cfg = services if services is not None else load_service_config()
     statuses = {}
     for spec in specs:
         statuses[spec["id"]] = _load_status(runner, spec, timeout)
-    probes = {}
-    prober = probe if probe is not None else (lambda _url: None)
-    if probe is not None:
-        for spec in specs:
-            raw = statuses.get(spec["id"])
-            if not isinstance(raw, dict):
-                continue
-            suffix = str((raw.get("CurrentTailnet") or {}).get("MagicDNSSuffix") or "").rstrip(".")
-            for node in [raw.get("Self") or {}, *list((raw.get("Peer") or {}).values())]:
-                if not isinstance(node, dict):
-                    continue
-                dns = _clean_host(node.get("DNSName") or "")
-                if not dns and node.get("HostName") and suffix:
-                    dns = f"{node.get('HostName')}.{suffix}"
-                if dns:
-                    url = f"https://{dns}"
-                    probes[url] = prober(url)
-    elif prober is not probe_url:
-        pass
-    return merge_status(statuses, probes, daemons=specs)
+    prober = probe if probe is not None else probe_url
+    probes = {url: prober(url) for url in synthetic_service_urls(statuses, specs, cfg)}
+    resolver = resolve if resolve is not None else dns_resolves
+    return merge_status(statuses, probes, daemons=specs, services=cfg, resolve=resolver)
 
 
 def run_action(action: str, daemon_id: str, name: str, run=None, timeout: float = 6.0, daemons: list[dict] | None = None) -> int:
